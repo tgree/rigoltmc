@@ -23,34 +23,40 @@ class DS1104Z(tmc.USB488Device):
         return hdr, data[:hdr.transferSize]
 
     def _read_tmc_block(self, cmd_bin):
-        # Read the first 16 bytes so we can extract the data length.  The Rigol
-        # is super buggy and this kind of works around it.
-        hdr, data = self.query_bin(cmd_bin, transferSize=16)
-        assert hdr.transferSize == 16
-        assert len(data) == 16
+        # Read the first 2 bytes to get the number of digits.
+        hdr, data = self.query_bin(cmd_bin, transferSize=2)
+        assert hdr.transferSize == 2
+        assert len(data) == 2
 
-        # Extract the total data length from the start of the data section and
-        # compute the remaining transfer size.
+        # Extract the number of digits in the length word and then request it.
         assert data[0] == ord('#')
-        digits       = int(data[1:2])
-        count        = int(data[2:2 + digits])
-        transferSize = 2 + digits + count - 16 + 1
-
-        # Request the rest of it.
-        self.send_request_dev_dep_msg_in(transferSize=transferSize)
+        digits = int(data[1:])
+        self.send_request_dev_dep_msg_in(transferSize=digits)
         hdr2, data2 = self.recv_dev_dep_msg_in()
         assert hdr2.transferSize == len(data2)
-        assert hdr2.bmTransferAttributes == 1
+        assert len(data2) == digits
+        count = int(data2)
 
-        # Strip the header and the trailing newline.
-        assert data2[-1] == ord('\n')
-        hdr    = data[:2 + digits]
-        result = data[2 + digits:] + data2[:-1]
-        assert len(result) == count
-        return hdr, result
+        # Request the rest of the block plus the trailing newline.
+        self.send_request_dev_dep_msg_in(transferSize=count + 1)
+        hdr3, data3 = self.recv_dev_dep_msg_in()
+        assert hdr3.transferSize == len(data3)
+        assert hdr3.bmTransferAttributes == 1
+        assert len(data3) == count + 1
+
+        # Return the final result, stripping the trailing newline.
+        assert data3[-1] == ord('\n')
+        return data + data2, data3[:-1]
 
     def read_disp_data(self):
         return self._read_tmc_block(b':DISP:DATA?')
+
+    def read_error(self):
+        hdr, data   = self.exec(':SYST:ERR?')
+        data        = data.strip()
+        err, _, msg = data.partition(',')
+        assert msg[0] == msg[-1] == '"'
+        return int(err), msg[1:-1]
 
     @staticmethod
     def find_usb_dev(**kwargs):
