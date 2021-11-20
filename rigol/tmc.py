@@ -120,6 +120,21 @@ class GetCapabilities(btype.Struct):
     deviceCapabilities    = btype.uint8_t()
     rsrv2                 = btype.Array(btype.uint8_t(), 6)
     rsrv3                 = btype.Array(btype.uint8_t(), 12)
+    _EXPECTED_SIZE = 24
+
+
+class GetCapabilities488(btype.Struct):
+    status                      = btype.uint8_t()
+    rsrv1                       = btype.uint8_t()
+    bcdUCBTMC                   = btype.uint16_t()
+    usbtmcInterfaceCapabilities = btype.uint8_t()
+    usbtmcDeviceCapabilities    = btype.uint8_t()
+    rsrv2                       = btype.Array(btype.uint8_t(), 6)
+    bcdUSB488                   = btype.uint16_t()
+    usb488InterfaceCapabilities = btype.uint8_t()
+    usb488DeviceCapabilities    = btype.uint8_t()
+    rsrv3                       = btype.Array(btype.uint8_t(), 8)
+    _EXPECTED_SIZE = 24
 
 
 class TMCException(Exception):
@@ -135,9 +150,9 @@ class GetCapabilitiesException(TMCException):
 
 
 class Device:
-    def __init__(self, usb_dev):
+    def __init__(self, usb_dev, allowed_protocols=(0x00,)):
         self.usb_dev         = usb_dev
-        self.tag             = 0
+        self.tag             = 2
         self.config          = None
         self.intf            = None
         self.bulk_in_ep      = None
@@ -145,11 +160,11 @@ class Device:
         self.interrupt_in_ep = None
         for config in self.usb_dev.configurations():
             for intf in config.interfaces():
-                if intf.bInterfaceClass != 0xFE:
+                if intf.bInterfaceClass != 0xFE:        # Application-Class
                     continue
-                if intf.bInterfaceSubClass != 0x03:
+                if intf.bInterfaceSubClass != 0x03:     # USBTMC
                     continue
-                if intf.bInterfaceProtocol != 0x01:
+                if intf.bInterfaceProtocol not in allowed_protocols:
                     continue
 
                 self.config = config
@@ -170,6 +185,8 @@ class Device:
 
                 assert self.bulk_in_ep is not None
                 assert self.bulk_out_ep is not None
+
+        self.max_out_size = self.bulk_out_ep.wMaxPacketSize
 
     def activate(self):
         try:
@@ -199,6 +216,7 @@ class Device:
         data = self.usb_dev.ctrl_transfer(
             0xA1, 7, wIndex=self.intf.bInterfaceNumber, data_or_wLength=0x18)
         resp = GetCapabilities.unpack(data)
+
         if resp.status == STATUS_SUCCESS:
             return resp
 
@@ -208,8 +226,10 @@ class Device:
         raise NotImplementedError
 
     def new_tag(self):
-        tag       = self.tag
+        tag = self.tag
         self.tag += 1
+        if self.tag == 128:
+            self.tag = 2
         return tag
 
     def send_dev_dep_msg(self, data):
@@ -221,7 +241,7 @@ class Device:
                 bmTransferAttributes=0x01)
         pad = (-(msg._EXPECTED_SIZE + len(data)) % 4)
         cmd = msg.pack() + data + b'\x00'*pad
-        assert len(cmd) <= self.bulk_out_ep.wMaxPacketSize
+        assert len(cmd) <= self.max_out_size
         self.bulk_out_ep.write(cmd)
         return tag
 
@@ -233,28 +253,80 @@ class Device:
                 bTagInverse=(~tag & 0xFF),
                 transferSize=transferSize)
         cmd = msg.pack()
-        print(cmd)
-        assert len(cmd) <= self.bulk_out_ep.wMaxPacketSize
+        assert len(cmd) <= self.max_out_size
         self.bulk_out_ep.write(cmd)
         return tag
 
-    def recv_dev_dep_msg_in(self, transferSize=100):
-        # Receive a DEV_DEP_MSG_IN response from the device.  The response is
-        # terminated by a short packet.
-        data = self.bulk_in_ep.read(DevDepMsgIn._EXPECTED_SIZE + transferSize)
-        hdr  = DevDepMsgIn.unpack(data[:DevDepMsgIn._EXPECTED_SIZE])
-        return hdr, data[DevDepMsgIn._EXPECTED_SIZE:]
+    def recv_dev_dep_msg_in(self):
+        raise NotImplementedError
+
+    def cmd(self, cmd):
+        self.send_dev_dep_msg(cmd.encode())
 
     def query(self, cmd, transferSize=100):
         self.send_dev_dep_msg(cmd.encode())
         tag = self.send_request_dev_dep_msg_in(transferSize=transferSize)
-        hdr, data = self.recv_dev_dep_msg_in(transferSize=transferSize)
+        hdr, data = self.recv_dev_dep_msg_in()
         assert hdr.bTag == tag
         return hdr, bytes(data).decode()
+
+    def exec(self, cmd, **kwargs):
+        if cmd.strip()[-1] == '?':
+            return self.query(cmd, **kwargs)
+        return self.cmd(cmd, **kwargs)
+
+    def cmd_bin(self, cmd):
+        self.send_dev_dep_msg(cmd)
 
     def query_bin(self, cmd_bytes, transferSize=100):
         self.send_dev_dep_msg(cmd_bytes)
         tag = self.send_request_dev_dep_msg_in(transferSize=transferSize)
-        hdr, data = self.recv_dev_dep_msg_in(transferSize=transferSize)
+        hdr, data = self.recv_dev_dep_msg_in()
         assert hdr.bTag == tag
         return hdr, bytes(data)
+
+    def exec_bin(self, cmd, **kwargs):
+        if cmd.strip()[-1:] == b'?':
+            return self.query_bin(cmd, **kwargs)
+        return self.cmd_bin(cmd, **kwargs)
+
+
+class USB488Device(Device):
+    def __init__(self, usb_dev):
+        super().__init__(usb_dev, allowed_protocols=(0x01,))
+
+    def get_capabilities(self):
+        data = self.usb_dev.ctrl_transfer(
+            0xA1, 7, wIndex=self.intf.bInterfaceNumber, data_or_wLength=0x18)
+        resp = GetCapabilities488.unpack(data)
+
+        if resp.status == STATUS_SUCCESS:
+            return resp
+
+        raise GetCapabilitiesException('GetCapabilities488 failed', resp)
+
+    def read_status_byte(self):
+        tag  = self.new_tag()
+        data = self.usb_dev.ctrl_transfer(
+            0xA1, 128, wIndex=self.intf.bInterfaceNumber, data_or_wLength=3,
+            wValue=tag)
+        if data[0] != STATUS_SUCCESS:
+            raise Exception('Read status byte failed: %u' % data[0])
+        assert data[1] == tag
+
+        if self.interrupt_in_ep is not None:
+            assert data[2] == 0x00
+            data = self.interrupt_in_ep.read(2)
+            assert data[0] == (0x80 | tag)
+            return data[1]
+
+        return data[2]
+
+    def ren_control(self):
+        raise NotImplementedError
+
+    def go_to_local(self):
+        raise NotImplementedError
+
+    def local_lockout(self):
+        raise NotImplementedError
